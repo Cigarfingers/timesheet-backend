@@ -6,38 +6,58 @@ const app = express();
 app.use(cors());
 app.use(express.json());
 
-// Railway injects DATABASE_URL automatically
-const pool = new Pool({
-  connectionString: process.env.DATABASE_URL,
-  ssl: { rejectUnauthorized: false }
-});
-
 // PINs - change these if needed
 const PINS = {
   '1311': 'daughter',  // Libby - can log and view
   '1987': 'parent'     // Parent - view only
 };
 
-// ── Setup DB on first run ──────────────────────────────────
-async function setupDB() {
-  await pool.query(`
-    CREATE TABLE IF NOT EXISTS shifts (
-      id SERIAL PRIMARY KEY,
-      shift_date DATE NOT NULL,
-      start_time TIME NOT NULL,
-      end_time TIME NOT NULL,
-      hours_worked DECIMAL(4,2) NOT NULL,
-      pay DECIMAL(8,2) NOT NULL,
-      note TEXT,
-      submitted BOOLEAN DEFAULT FALSE,
-      created_at TIMESTAMPTZ DEFAULT NOW()
-    );
-  `);
-  console.log('DB ready');
+// ── Database connection ────────────────────────────────────
+if (!process.env.DATABASE_URL) {
+  console.error('DATABASE_URL is not set.');
+  console.error('In Railway: go to your Postgres plugin → Connect tab');
+  console.error('and copy the DATABASE_URL into your backend service Variables.');
+  process.exit(1);
+}
+
+const pool = new Pool({
+  connectionString: process.env.DATABASE_URL,
+  ssl: { rejectUnauthorized: false },
+  connectionTimeoutMillis: 10000,
+});
+
+// ── Setup DB with retry (Railway DB may start slower than app) ─
+async function setupDB(retries = 8) {
+  try {
+    await pool.query(`
+      CREATE TABLE IF NOT EXISTS shifts (
+        id SERIAL PRIMARY KEY,
+        shift_date DATE NOT NULL,
+        start_time TIME NOT NULL,
+        end_time TIME NOT NULL,
+        hours_worked DECIMAL(4,2) NOT NULL,
+        pay DECIMAL(8,2) NOT NULL,
+        note TEXT,
+        submitted BOOLEAN DEFAULT FALSE,
+        created_at TIMESTAMPTZ DEFAULT NOW()
+      );
+    `);
+    console.log('DB ready');
+  } catch (e) {
+    if (retries > 0) {
+      console.log('DB not ready yet, retrying in 3s... (' + retries + ' left)');
+      await new Promise(r => setTimeout(r, 3000));
+      return setupDB(retries - 1);
+    }
+    console.error('Could not connect to DB:', e.message);
+  }
 }
 setupDB();
 
-// ── Auth check ─────────────────────────────────────────────
+// ── Health check ───────────────────────────────────────────
+app.get('/', (req, res) => res.json({ status: 'ok' }));
+
+// ── Auth ───────────────────────────────────────────────────
 app.post('/auth', (req, res) => {
   const { pin } = req.body;
   const role = PINS[pin];
@@ -64,9 +84,8 @@ app.post('/shifts', async (req, res) => {
     return res.status(400).json({ error: 'Missing required fields' });
   }
 
-  // Calculate hours
-  const start = new Date(`2000-01-01T${start_time}`);
-  const end = new Date(`2000-01-01T${end_time}`);
+  const start = new Date('2000-01-01T' + start_time);
+  const end = new Date('2000-01-01T' + end_time);
   if (end <= start) return res.status(400).json({ error: 'End time must be after start time' });
 
   const hours = (end - start) / 3600000;
@@ -74,8 +93,7 @@ app.post('/shifts', async (req, res) => {
 
   try {
     const result = await pool.query(
-      `INSERT INTO shifts (shift_date, start_time, end_time, hours_worked, pay, note)
-       VALUES ($1, $2, $3, $4, $5, $6) RETURNING *`,
+      'INSERT INTO shifts (shift_date, start_time, end_time, hours_worked, pay, note) VALUES ($1, $2, $3, $4, $5, $6) RETURNING *',
       [shift_date, start_time, end_time, hours, pay, note || null]
     );
     res.json(result.rows[0]);
@@ -98,8 +116,7 @@ app.delete('/shifts/:id', async (req, res) => {
 app.get('/shifts/next-block', async (req, res) => {
   try {
     const result = await pool.query(
-      `SELECT * FROM shifts WHERE submitted = FALSE
-       ORDER BY shift_date ASC, start_time ASC LIMIT 8`
+      'SELECT * FROM shifts WHERE submitted = FALSE ORDER BY shift_date ASC, start_time ASC LIMIT 8'
     );
     res.json(result.rows);
   } catch (e) {
@@ -112,10 +129,7 @@ app.post('/shifts/mark-submitted', async (req, res) => {
   const { ids } = req.body;
   if (!ids || !ids.length) return res.status(400).json({ error: 'No IDs provided' });
   try {
-    await pool.query(
-      'UPDATE shifts SET submitted = TRUE WHERE id = ANY($1)',
-      [ids]
-    );
+    await pool.query('UPDATE shifts SET submitted = TRUE WHERE id = ANY($1)', [ids]);
     res.json({ ok: true });
   } catch (e) {
     res.status(500).json({ error: e.message });
@@ -123,4 +137,4 @@ app.post('/shifts/mark-submitted', async (req, res) => {
 });
 
 const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => console.log(`Server running on port ${PORT}`));
+app.listen(PORT, () => console.log('Server running on port ' + PORT));
